@@ -1,0 +1,7 @@
+python-telegram-bot==21.*
+python-dotenv
+httpx[http2]
+aiosqlite
+aiofiles
+yt-dlp
+loguru

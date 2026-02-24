@@ -1,0 +1,7 @@
+.env
+__pycache__
+.venv
+tmp
+data
+log
+tg_data
