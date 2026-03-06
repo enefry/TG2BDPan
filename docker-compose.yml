@@ -13,6 +13,9 @@ services:
       - ./log:/var/log
       # - ./app:/app
       - ./tg_data:/var/lib/telegram-bot-api
+    extra_hosts:
+      - "pcs.baidu.com:36.110.192.115"
+      - "pcs.baidu.com:111.63.96.140"
 
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest

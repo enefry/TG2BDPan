@@ -119,9 +119,36 @@ async def _do_transfer(
         )
         notifier = ProgressNotifier(msg, f"⏫ 正在上传 `{filename}`")
 
-        result: dict[str, Any] = await baidu_pan.upload_file(
-            user_id, local_path, filename, progress_cb=notifier
-        )
+        max_retries = 3
+        retry_delay = 5
+        result: dict[str, Any] = {}
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = await baidu_pan.upload_file(
+                    user_id, local_path, filename, progress_cb=notifier
+                )
+                break
+            except Exception as e:
+                logger.exception(
+                    f"上传百度网盘异常: {filename}, 第 {attempt}/{max_retries} 次尝试"
+                )
+                if attempt < max_retries:
+                    try:
+                        await msg.edit_text(
+                            f"⚠️ 转存异常，{retry_delay} 秒后重试 ({attempt}/{max_retries})：\n{str(e)[:100]}"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(retry_delay)
+                else:
+                    try:
+                        await msg.edit_text(
+                            f"❌ 最终转存失败，已重试 {max_retries} 次：\n{str(e)[:200]}"
+                        )
+                    except Exception:
+                        pass
+                    return
 
         if result["ok"]:
             await msg.edit_text(
