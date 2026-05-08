@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   pan_saver:
     build: .
@@ -9,9 +7,12 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./tmp:/tmp/pan_saver
+      # - ./app/bot.py:/app/bot.py
+      # - ./app/nsfw_detect.py:/app/nsfw_detect.py
+      # - ./app/sensitive_detect.py:/app/sensitive_detect.py
+      # - ./app/baidu_pan.py:/app/baidu_pan.py
+      - ./tmp:/tmp/
       - ./log:/var/log
-      # - ./app:/app
       - ./tg_data:/var/lib/telegram-bot-api
     extra_hosts:
       - "pcs.baidu.com:36.110.192.115"

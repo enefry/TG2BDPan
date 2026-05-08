@@ -31,7 +31,7 @@ def _ensure_tmp_dir(user_id: int) -> str:
 
 def _safe_filename(name: str) -> str:
     """去除文件名中的非法字符"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|!]', "_", name)
     return name[:200] or "file"
 
 
@@ -234,7 +234,7 @@ async def _download_ytdlp(
     if lines:
         filepath = lines[-1]
         if os.path.isfile(filepath):
-            logger.info(f"yt-dlp 下载完成: filepath")
+            logger.info(f"yt-dlp 下载完成: {filepath}")
             return filepath
 
     # fallback：扫描 tmp_dir 找到最新文件

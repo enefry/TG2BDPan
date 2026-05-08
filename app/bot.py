@@ -17,12 +17,24 @@ from telegram.ext import (
     filters,
 )
 from loguru import logger
-
 import baidu_pan, db
 from config import config
 from downloader import download_telegram_file, download_url
+from nsfw_detect import nsfw_detect
+from sensitive_detect import SensitiveDetector
+import pyzipper
+import zipfile
+import tempfile
+import shutil
+
+# ─── 媒体组状态 ───────────────────────────────────────────────────────────────
+
+MEDIA_GROUP_STORE: dict[str, list[Update]] = {}
+MEDIA_GROUP_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ─── 白名单检查 ─────────────────────────────────────────────────────────────────
+
+sensitiveDetector = SensitiveDetector(auto_update=False)
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -102,6 +114,79 @@ class ProgressNotifier:
             pass
 
 
+def _zip_path(
+    local_path: str, target_path: str | None, zip_password: Optional[str] = None
+) -> str:
+    """
+    将文件或目录压缩为临时 zip，返回临时文件路径。
+    调用方负责用完后删除该临时文件。
+    """
+
+    def _add_to_zip(zf: pyzipper.ZipFile, path: str, arcname: str):
+        if os.path.isdir(path):
+            for item in os.listdir(path):
+                item_path = os.path.join(path, item)
+                item_arc = os.path.join(arcname, sensitiveDetector.replace(item))
+                _add_to_zip(zf, item_path, item_arc)
+        else:
+            zf.write(path, arcname=arcname)
+
+    base_name = sensitiveDetector.replace(os.path.basename(local_path))
+
+    if target_path is None:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            target_path = tmp.name
+
+    if zip_password:
+        with pyzipper.AESZipFile(
+            target_path,
+            "w",
+            compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
+        ) as zf:
+            zf.setpassword(zip_password.encode("utf-8"))
+            _add_to_zip(zf, local_path, base_name)
+    else:
+        with pyzipper.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            _add_to_zip(zf, local_path, base_name)
+
+    return target_path
+
+
+async def safe_upload(
+    user_id: int,
+    local_path: str,
+    remote_filename: str,
+    progress_cb: Optional[baidu_pan.ProgressCallback] = None,
+    zip_password: Optional[str] = "1234",
+) -> dict[str, Any]:
+    need_remove_files = set()
+    dir_name = os.path.dirname(local_path)
+    base_name = os.path.splitext(remote_filename)[0]
+    base_name = sensitiveDetector.replace(base_name, "_")
+    remote_filename = f"{base_name}{os.path.splitext(remote_filename)[1]}"
+    is_nsfw = await nsfw_detect(local_path)
+    logger.info(f'NSFW Detection: path={local_path},remote filename={remote_filename}, is_nsfw: {is_nsfw},is directory: {os.path.isdir(local_path)}')
+    if is_nsfw or os.path.isdir(local_path):
+        need_remove_files.add(local_path)
+        zip_path = os.path.join(dir_name, base_name + ".zip")
+        local_path = _zip_path(local_path, zip_path, zip_password)
+        need_remove_files.add(local_path)
+        remote_filename = f"{base_name}.bundle"
+
+    try:
+        result = await baidu_pan.upload_file(
+            user_id, local_path, remote_filename, progress_cb=progress_cb
+        )
+    finally:
+        for file_path in need_remove_files:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+            else:
+                shutil.rmtree(file_path, ignore_errors=True)
+    return result
+
+
 async def _do_transfer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -125,7 +210,7 @@ async def _do_transfer(
 
         for attempt in range(1, max_retries + 1):
             try:
-                result = await baidu_pan.upload_file(
+                result = await safe_upload(
                     user_id, local_path, filename, progress_cb=notifier
                 )
                 break
@@ -344,7 +429,32 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     msg = update.message
 
+    # 1. 拦截 Media Group
+    media_group_id = msg.media_group_id
+    if media_group_id:
+        if media_group_id not in MEDIA_GROUP_LOCKS:
+            MEDIA_GROUP_LOCKS[media_group_id] = asyncio.Lock()
+
+        async with MEDIA_GROUP_LOCKS[media_group_id]:
+            if media_group_id not in MEDIA_GROUP_STORE:
+                MEDIA_GROUP_STORE[media_group_id] = []
+                # First message in the group: schedule a background task
+                asyncio.create_task(
+                    _process_media_group(media_group_id, update, context)
+                )
+            MEDIA_GROUP_STORE[media_group_id].append(update)
+        return
+
     # 提取 file_id 和文件名
+    file_id, filename = _get_file_info(msg)
+    if not file_id:
+        return
+
+    await _process_single_file(update, context, msg, file_id, filename, user_id)
+
+
+def _get_file_info(msg: Message) -> tuple[Optional[str], str]:
+    """Helper to extract file_id and filename from a message."""
     if msg.document:
         file_id = msg.document.file_id
         filename = msg.document.file_name or f"document_{file_id[:8]}"
@@ -371,8 +481,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         file_id = msg.sticker.file_id
         filename = f"sticker_{file_id[:8]}.webp"
     else:
-        await msg.reply_text("⚠️ 不支持该文件类型")
-        return
+        return None, ""
+    return file_id, filename
+
+
+async def _process_single_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    msg: Message,
+    file_id: str,
+    filename: str,
+    user_id: int,
+) -> None:
 
     # 校验文件大小（Telegram 官方 API 限制 bot 只能下载 20MB 以下的文件，Local Bot 限制 2GB）
     attachment = msg.effective_attachment
@@ -413,6 +533,122 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         logger.exception(f"下载 TG 文件失败: {file_id}")
         await progress_msg.edit_text(f"❌ 下载失败：{str(e)[:200]}")
+
+
+async def _process_media_group(
+    media_group_id: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """处理包含多个文件的一组消息，打包加密压缩后转存"""
+    user_id = update.effective_user.id
+    # 等待该组所有消息差不多都送达 (3秒应该足够)
+    await asyncio.sleep(3.0)
+
+    async with MEDIA_GROUP_LOCKS[media_group_id]:
+        if media_group_id not in MEDIA_GROUP_STORE:
+            return  # 被其他机制处理了？
+        updates = MEDIA_GROUP_STORE.pop(media_group_id)
+        if media_group_id in MEDIA_GROUP_LOCKS:
+            del MEDIA_GROUP_LOCKS[media_group_id]
+
+    if not updates:
+        return
+
+    msg = update.message
+    progress_msg = await msg.reply_text(
+        f"📦 收到媒体组 ({len(updates)} 个项目)，准备分类打包…"
+    )
+
+    tmp_folder = os.path.join(config.TMP_DIR, str(user_id), f"mg_{media_group_id}")
+    os.makedirs(tmp_folder, exist_ok=True)
+
+    caption_texts = []
+
+    try:
+        downloads = []
+        for i, upd in enumerate(updates):
+            curr_msg = upd.message
+            if not curr_msg:
+                continue
+            if curr_msg.caption:
+                caption_texts.append(curr_msg.caption)
+            if curr_msg.text:
+                caption_texts.append(curr_msg.text)
+
+            file_id, filename = _get_file_info(curr_msg)
+            if file_id:
+                base, ext = os.path.splitext(filename)
+                d_filename = f"{base}_{i}{ext}"
+                downloads.append((file_id, d_filename, curr_msg))
+
+        if caption_texts:
+            caption_path = os.path.join(tmp_folder, "caption.txt")
+            with open(caption_path, "w", encoding="utf-8") as f:
+                f.write("\n\n---\n\n".join(caption_texts))
+
+        # 下载所有文件
+        for idx, (file_id, d_filename, curr_msg) in enumerate(downloads):
+            att = curr_msg.effective_attachment
+            if isinstance(att, list):
+                att = att[-1]
+            file_size = getattr(att, "file_size", 0)
+
+            if file_size and file_size > 2000 * 1024 * 1024:
+                continue
+            if not config.USE_LOCAL_API and file_size and file_size > 20 * 1024 * 1024:
+                continue
+
+            try:
+                notifier = ProgressNotifier(
+                    progress_msg,
+                    f"⬇️ 正在下载第 {idx+1}/{len(downloads)} 个文件 `{d_filename}`…",
+                )
+                local_path = await download_telegram_file(
+                    context.bot, file_id, user_id, d_filename, progress_cb=notifier
+                )
+                # 移动到待打包目录
+                new_path = os.path.join(tmp_folder, d_filename)
+                os.rename(local_path, new_path)
+            except Exception as e:
+                logger.error(
+                    f"Failed to download media group element {d_filename}: {e}"
+                )
+
+        import random
+        import string
+
+        # zip 打包
+        rand_suffix = "".join(
+            random.choices(string.ascii_lowercase + string.digits, k=4)
+        )
+        remote_filename = f"media_group_{media_group_id}_{rand_suffix}.bundle"
+        await _do_transfer(update, context, tmp_folder, remote_filename)
+        # zip_path = os.path.join(config.TMP_DIR, str(user_id), zip_filename)
+
+        # await progress_msg.edit_text("🗜 正在加密压缩 (为防和谐后缀设为 .bundle)…")
+
+        # # 使用 zip 命令行打包，加入密码并使用 .dat 后缀防屏蔽
+        # cmd = ["zip", "-P", "1234", "-j", zip_path] + [
+        #     os.path.join(tmp_folder, f) for f in os.listdir(tmp_folder)
+        # ]
+        # if not os.listdir(tmp_folder):
+        #     await progress_msg.edit_text("❌ 压缩打包失败：没有找到有效文件")
+        #     return
+
+        # proc = await asyncio.create_subprocess_exec(
+        #     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        # )
+        # stdout, stderr = await proc.communicate()
+
+        # if proc.returncode == 0 and os.path.isfile(zip_path):
+        #     await progress_msg.delete()
+        #     await _do_transfer(update, context, zip_path, zip_filename)
+        # else:
+        #     logger.error(f"zip 打包失败: {stderr.decode('utf-8', errors='replace')}")
+        #     await progress_msg.edit_text("❌ 压缩打包失败")
+    finally:
+
+        shutil.rmtree(tmp_folder, ignore_errors=True)
+        # 压缩文件在 _do_transfer 函数中也会被自动清理
 
 
 # ─── 注册 handlers ───────────────────────────────────────────────────────────────

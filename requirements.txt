@@ -5,3 +5,7 @@ aiosqlite
 aiofiles
 yt-dlp
 loguru
+Pillow
+python-magic
+pyahocorasick
+pyzipper

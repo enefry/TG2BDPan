@@ -9,7 +9,7 @@ from typing import Optional, Any, Callable, Awaitable
 
 import httpx
 from loguru import logger
-
+import datetime
 import db
 from config import config
 
@@ -20,6 +20,7 @@ UPLOAD_BASE: str = "https://d.pcs.baidu.com/rest/2.0/pcs"
 CHUNK_SIZE: int = 4 * 1024 * 1024  # 4MB
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
+
 
 
 def get_auth_url() -> str:
@@ -151,6 +152,11 @@ async def upload_file(
     if not access_token:
         return {"ok": False, "error": "未授权，请先发送 /auth 完成授权"}
 
+    logger.info(
+        f"Uploading {local_path} file {remote_filename} to Baidu Pan for user {user_id}"
+    )
+
+
     remote_path: str = f"{config.BAIDU_SAVE_PATH.rstrip('/')}/{remote_filename}"
     file_size: int = os.path.getsize(local_path)
     block_list: list[str] = []
@@ -175,7 +181,7 @@ async def upload_file(
         "isdir": 0,
         "autoinit": 1,
         "block_list": str(block_list).replace("'", '"'),
-        "rtype": 1,
+        "rtype": 3,
     }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
@@ -186,7 +192,7 @@ async def upload_file(
         pre = resp.json()
 
     if "uploadid" not in pre:
-        logger.error(f"precreate 失败: {pre}")
+        logger.error(f"precreate 失败: {pre} of precreate_data={precreate_data}")
         return {"ok": False, "error": f"预创建失败: {pre.get('errmsg', pre)}"}
 
     upload_id: str = pre["uploadid"]
@@ -215,10 +221,20 @@ async def upload_file(
                     result = resp.json()
                     if "md5" in result:
                         break
+                    else:
+                        logger.warning(f"分片 {idx} 上传警告，返回值缺少md5: {result}")
+                        if attempt == 2:
+                            return {
+                                "ok": False,
+                                "error": f"分片 {idx} 上传失败，百度接口返回: {result}",
+                            }
                 except Exception as e:
                     if attempt == 2:
-                        return {"ok": False, "error": f"分片 {idx} 上传失败: {e}"}
+                        return {"ok": False, "error": f"分片 {idx} 上传异常: {e}"}
                     await asyncio.sleep(2)
+            else:
+                # 只有当 break 没有触发时才会进到这里，说明3次尝试全都失败
+                return {"ok": False, "error": f"分片 {idx} 上传失败，多次重试无效"}
 
             uploaded_size += chunk_len
             if progress_cb:
@@ -231,7 +247,7 @@ async def upload_file(
         "isdir": 0,
         "uploadid": upload_id,
         "block_list": str(block_list).replace("'", '"'),
-        "rtype": 1,
+        "rtype": 3,
     }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
@@ -241,8 +257,34 @@ async def upload_file(
         )
         result = resp.json()
 
-    if result.get("errno", -1) != 0:
-        logger.error(f"create 失败: {result}")
-        return {"ok": False, "error": f"创建文件失败: {result.get('errmsg', result)}"}
+    if result.get("errno", -1) == -7:
+        fallback_path = f"/ato_saves/fallback/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.dat"
+        logger.error(
+            f"create 失败: {result} of create_data={create_data}, remote_path={remote_path} 失败,尝试兜底:{fallback_path}"
+        )
+        create_data: dict[str, Any] = {
+            "path": fallback_path,
+            "size": file_size,
+            "isdir": 0,
+            "uploadid": upload_id,
+            "block_list": str(block_list).replace("'", '"'),
+            "rtype": 3,
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{PCS_BASE}/file",
+                params={"method": "create", "access_token": access_token},
+                data=create_data,
+            )
+            result = resp.json()
+            remote_path = fallback_path
 
+    if result.get("errno", -1) != 0:
+        logger.error(f"create 失败: {result} of create_data={create_data}")
+        return {
+            "ok": False,
+            "error": f"创建文件失败: {result.get('errmsg', result)},remote_path={remote_path}",
+        }
+    else:
+        logger.info(f"文件创建成功: {remote_path},result={result}")
     return {"ok": True, "path": remote_path}

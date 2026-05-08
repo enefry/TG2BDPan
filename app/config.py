@@ -38,7 +38,7 @@ class Config:
 
     # 日志配置
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE: str = os.getenv("LOG_FILE", "/app/data/pan_saver.log")
+    LOG_FILE: str = os.getenv("LOG_FILE", "/var/log/pan_saver.log")
 
 
 config = Config()
