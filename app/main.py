@@ -13,8 +13,10 @@ async def background_refresh_task():
         try:
             logger.info("后台刷新检测任务启动")
             users = await db.get_all_users()
+            logger.info(f'所有用户：{users}')
             for uid in users:
                 await baidu_pan.get_valid_token(uid)
+            
         except Exception as e:
             logger.exception("后台定期刷新出错")
 

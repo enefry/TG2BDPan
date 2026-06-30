@@ -114,6 +114,17 @@ class ProgressNotifier:
             pass
 
 
+def path_sensitive(path: str) -> str:
+    nameTuple = os.path.splitext(os.path.basename(path))
+    if len(nameTuple[0]) > 0:
+        name = f"{sensitiveDetector.replace(nameTuple[0],repl="_")}"
+        if len(nameTuple[1]) > 1:
+            return f"{name}{nameTuple[1]}"
+        else:
+            return name
+    else:
+        return path
+
 def _zip_path(
     local_path: str, target_path: str | None, zip_password: Optional[str] = None
 ) -> str:
@@ -126,12 +137,12 @@ def _zip_path(
         if os.path.isdir(path):
             for item in os.listdir(path):
                 item_path = os.path.join(path, item)
-                item_arc = os.path.join(arcname, sensitiveDetector.replace(item))
+                item_arc = os.path.join(arcname, path_sensitive(item))
                 _add_to_zip(zf, item_path, item_arc)
         else:
             zf.write(path, arcname=arcname)
 
-    base_name = sensitiveDetector.replace(os.path.basename(local_path))
+    base_name = path_sensitive(local_path)
 
     if target_path is None:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -166,7 +177,9 @@ async def safe_upload(
     base_name = sensitiveDetector.replace(base_name, "_")
     remote_filename = f"{base_name}{os.path.splitext(remote_filename)[1]}"
     is_nsfw = await nsfw_detect(local_path)
-    logger.info(f'NSFW Detection: path={local_path},remote filename={remote_filename}, is_nsfw: {is_nsfw},is directory: {os.path.isdir(local_path)}')
+    logger.info(
+        f"NSFW Detection: path={local_path},remote filename={remote_filename}, is_nsfw: {is_nsfw},is directory: {os.path.isdir(local_path)}"
+    )
     if is_nsfw or os.path.isdir(local_path):
         need_remove_files.add(local_path)
         zip_path = os.path.join(dir_name, base_name + ".zip")

@@ -3,6 +3,7 @@ python-dotenv
 httpx[http2]
 aiosqlite
 aiofiles
+beautifulsoup4
 yt-dlp
 loguru
 Pillow

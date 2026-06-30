@@ -10,17 +10,34 @@ import asyncio
 import mimetypes
 import os
 import re
+import shutil
+import sys
 import urllib.parse
 from typing import Optional, Callable, Awaitable
 
 import aiofiles
 import httpx
+from bs4 import BeautifulSoup
 from loguru import logger
+from PIL import Image
 from telegram import Bot
 
 from config import config
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
+
+_YTDLP_UPDATE_LOCK = asyncio.Lock()
+_YTDLP_UPDATE_WARNING_RE = re.compile(
+    r"yt-dlp version .* is older than 90 days|You installed yt-dlp with pip",
+    re.I,
+)
+_HTML_ASSET_MIN_SIZE = 256
+_HTML_ASSET_MAX_CANDIDATES = 200
+_HTML_ASSET_CONCURRENCY = 5
+_REQUEST_HEADERS: dict[str, str] = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
 
 def _ensure_tmp_dir(user_id: int) -> str:
@@ -118,14 +135,10 @@ async def _download_http(
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
     """通用 httpx 流式下载"""
-    headers: dict[str, str] = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(30, read=300),
         follow_redirects=True,
-        headers=headers,
+        headers=_REQUEST_HEADERS,
     ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -145,18 +158,13 @@ async def _download_direct(
     progress_cb: Optional[ProgressCallback] = None,
 ) -> str:
     """下载普通 HTTP 直链，自动推断文件名"""
-    headers: dict[str, str] = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
     cd: str = ""
     ct: str = "application/octet-stream"
     # 先 HEAD 获取文件名和类型
     async with httpx.AsyncClient(
         timeout=15,
         follow_redirects=True,
-        headers=headers,
+        headers=_REQUEST_HEADERS,
     ) as client:
         try:
             head = await client.head(url)
@@ -164,6 +172,9 @@ async def _download_direct(
             ct = head.headers.get("content-type", "application/octet-stream")
         except Exception:
             pass
+
+    if _is_html_content_type(ct) or _is_probably_html_url(url):
+        return await _download_html_assets(url, tmp_dir, progress_cb)
 
     filename: str = _extract_filename_from_headers(cd, url, ct)
     local_path: str = os.path.join(tmp_dir, filename)
@@ -193,6 +204,264 @@ def _extract_filename_from_headers(
     return f"download{ext}"
 
 
+def _is_html_content_type(content_type: str) -> bool:
+    return "text/html" in content_type.lower()
+
+
+def _is_probably_html_url(url: str) -> bool:
+    ext = _url_ext(url)
+    return ext in {"", ".html", ".htm", ".shtml", ".xhtml"}
+
+
+async def _download_html_assets(
+    url: str,
+    tmp_dir: str,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> str:
+    """下载 HTML 页面中的图片和 mp4，过滤低分辨率资源后返回资源目录"""
+    if progress_cb:
+        await progress_cb(0, 0)
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30, read=120),
+        follow_redirects=True,
+        headers=_REQUEST_HEADERS,
+    ) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if not _is_html_content_type(content_type):
+                filename = _extract_filename_from_headers(
+                    resp.headers.get("content-disposition", ""),
+                    str(resp.url),
+                    content_type,
+                )
+                local_path = os.path.join(tmp_dir, filename)
+                total_size = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                async with aiofiles.open(local_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=8192):
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb:
+                            await progress_cb(downloaded, total_size)
+                logger.info(f"HTTP 文件已下载: {local_path}")
+                return local_path
+
+            body = await resp.aread()
+            page_url = str(resp.url)
+            encoding = resp.encoding or "utf-8"
+
+    soup = BeautifulSoup(body.decode(encoding, errors="replace"), "html.parser")
+    candidates = _extract_html_asset_urls(soup, page_url)
+    if not candidates:
+        raise RuntimeError("网页中没有找到图片或 mp4 资源")
+
+    page_name = _safe_filename(_html_page_name(soup, page_url))
+    asset_dir = os.path.join(tmp_dir, page_name)
+    if os.path.exists(asset_dir):
+        shutil.rmtree(asset_dir, ignore_errors=True)
+    os.makedirs(asset_dir, exist_ok=True)
+
+    semaphore = asyncio.Semaphore(_HTML_ASSET_CONCURRENCY)
+    accepted = 0
+    failed = 0
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30, read=300),
+        follow_redirects=True,
+        headers=_REQUEST_HEADERS,
+    ) as client:
+
+        async def worker(index: int, asset_url: str) -> bool:
+            async with semaphore:
+                return await _download_one_html_asset(client, asset_url, asset_dir, index)
+
+        tasks = [
+            worker(index, asset_url)
+            for index, asset_url in enumerate(
+                candidates[:_HTML_ASSET_MAX_CANDIDATES], start=1
+            )
+        ]
+        for done_count, task in enumerate(asyncio.as_completed(tasks), start=1):
+            try:
+                if await task:
+                    accepted += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"网页资源下载失败: {e}")
+            if progress_cb:
+                await progress_cb(done_count, len(tasks))
+
+    if accepted == 0:
+        shutil.rmtree(asset_dir, ignore_errors=True)
+        raise RuntimeError("网页资源下载完成，但没有符合尺寸要求的图片或 mp4")
+
+    logger.info(f"网页资源下载完成: {asset_dir}, accepted={accepted}, skipped={failed}")
+    return asset_dir
+
+
+def _extract_html_asset_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
+    urls: list[str] = []
+
+    def add(raw_url: str | None) -> None:
+        if not raw_url:
+            return
+        raw_url = raw_url.strip()
+        if not raw_url or raw_url.startswith(("data:", "blob:", "javascript:")):
+            return
+        absolute = urllib.parse.urljoin(page_url, raw_url)
+        absolute, _ = urllib.parse.urldefrag(absolute)
+        if absolute not in urls:
+            urls.append(absolute)
+
+    for img in soup.find_all("img"):
+        add(img.get("src"))
+        add(img.get("data-src"))
+        add(img.get("data-original"))
+        for src in _parse_srcset(str(img.get("srcset") or "")):
+            add(src)
+
+    for video in soup.find_all("video"):
+        add(video.get("src"))
+        add(video.get("poster"))
+
+    for source in soup.find_all("source"):
+        src = source.get("src")
+        source_type = str(source.get("type") or "").lower()
+        if src and ("video/mp4" in source_type or _url_ext(src) == ".mp4"):
+            add(src)
+        for srcset_url in _parse_srcset(str(source.get("srcset") or "")):
+            add(srcset_url)
+
+    for meta in soup.find_all("meta"):
+        prop = str(meta.get("property") or meta.get("name") or "").lower()
+        content = meta.get("content")
+        if prop in {"og:image", "twitter:image", "og:video", "og:video:url"}:
+            add(content)
+
+    return urls
+
+
+def _parse_srcset(srcset: str) -> list[str]:
+    urls: list[str] = []
+    for part in srcset.split(","):
+        candidate = part.strip().split()
+        if candidate:
+            urls.append(candidate[0])
+    return urls
+
+
+def _url_ext(url: str) -> str:
+    return os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+
+
+def _html_page_name(soup: BeautifulSoup, page_url: str) -> str:
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    parsed = urllib.parse.urlparse(page_url)
+    name = os.path.basename(parsed.path.rstrip("/"))
+    return name or parsed.netloc or "webpage_assets"
+
+
+async def _download_one_html_asset(
+    client: httpx.AsyncClient,
+    asset_url: str,
+    asset_dir: str,
+    index: int,
+) -> bool:
+    async with client.stream("GET", asset_url) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+        ext = _asset_extension(asset_url, content_type)
+        if not ext:
+            return False
+
+        filename = _safe_filename(f"{index:04d}_{_asset_basename(asset_url, ext)}")
+        local_path = os.path.join(asset_dir, filename)
+        async with aiofiles.open(local_path, "wb") as f:
+            async for chunk in resp.aiter_bytes(chunk_size=1024 * 64):
+                await f.write(chunk)
+
+    if await _is_low_resolution_asset(local_path, ext):
+        os.remove(local_path)
+        return False
+
+    logger.info(f"网页资源已下载: {local_path}")
+    return True
+
+
+def _asset_extension(asset_url: str, content_type: str) -> str:
+    ext = _url_ext(asset_url)
+    if ext == ".mp4":
+        return ".mp4"
+    if content_type == "video/mp4":
+        return ".mp4"
+    if content_type.startswith("image/"):
+        return mimetypes.guess_extension(content_type) or ext or ".img"
+    if ext and (mimetypes.guess_type(f"file{ext}")[0] or "").startswith("image/"):
+        return ext
+    return ""
+
+
+def _asset_basename(asset_url: str, ext: str) -> str:
+    name = os.path.basename(urllib.parse.urlparse(asset_url).path)
+    if not name:
+        return f"asset{ext}"
+    base, current_ext = os.path.splitext(name)
+    if current_ext:
+        return name
+    return f"{base}{ext}"
+
+
+async def _is_low_resolution_asset(local_path: str, ext: str) -> bool:
+    if ext == ".mp4":
+        size = await _probe_video_size(local_path)
+        if size is None:
+            return False
+        width, height = size
+        return width < _HTML_ASSET_MIN_SIZE or height < _HTML_ASSET_MIN_SIZE
+
+    try:
+        with Image.open(local_path) as image:
+            width, height = image.size
+        return width < _HTML_ASSET_MIN_SIZE or height < _HTML_ASSET_MIN_SIZE
+    except Exception as e:
+        logger.warning(f"图片尺寸读取失败，跳过资源: {local_path}, error={e}")
+        return True
+
+
+async def _probe_video_size(local_path: str) -> tuple[int, int] | None:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        local_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.warning(
+            f"mp4 分辨率读取失败，保留资源: {local_path}, error={stderr.decode(errors='replace')[-300:]}"
+        )
+        return None
+
+    text = stdout.decode(errors="replace").strip()
+    match = re.search(r"(\d+)x(\d+)", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 async def _download_ytdlp(
     url: str,
     tmp_dir: str,
@@ -214,22 +483,73 @@ async def _download_ytdlp(
         "after_move:filepath",  # 打印最终路径
         url,
     ]
+    returncode, stdout, stderr = await _run_ytdlp(cmd)
+
+    if returncode != 0 and _YTDLP_UPDATE_WARNING_RE.search(stderr):
+        logger.warning("yt-dlp 版本过旧，正在自动更新后重试下载")
+        if await _update_ytdlp():
+            returncode, stdout, stderr = await _run_ytdlp(cmd)
+        else:
+            raise RuntimeError(f"yt-dlp 自动更新失败，原始错误:\n{stderr[-500:]}")
+
+    if returncode != 0:
+        raise RuntimeError(f"yt-dlp 下载失败:\n{stderr[-500:]}")
+
+    if stderr and _YTDLP_UPDATE_WARNING_RE.search(stderr):
+        logger.warning("yt-dlp 版本过旧，下载成功后自动更新")
+        await _update_ytdlp()
+
+    if progress_cb:
+        await progress_cb(1, 1)  # 提示用户下载完成
+
+    return _find_ytdlp_output_file(stdout, tmp_dir)
+
+
+async def _run_ytdlp(cmd: list[str]) -> tuple[int, str, str]:
+    """运行 yt-dlp，失败时返回 stderr 给调用方判断是否需要自动更新"""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
+    out = stdout.decode(errors="replace")
+    err = stderr.decode(errors="replace")
 
-    if proc.returncode != 0:
-        err: str = stderr.decode(errors="replace")
-        raise RuntimeError(f"yt-dlp 下载失败:\n{err[-500:]}")
+    return proc.returncode, out, err
 
-    if progress_cb:
-        await progress_cb(1, 1)  # 提示用户下载完成
 
+async def _update_ytdlp() -> bool:
+    """通过当前 Python 环境的 pip 更新 yt-dlp，避免 Docker 内二进制路径不一致"""
+    async with _YTDLP_UPDATE_LOCK:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--upgrade",
+            "yt-dlp",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out = stdout.decode(errors="replace")
+        err = stderr.decode(errors="replace")
+        if proc.returncode == 0:
+            logger.info("yt-dlp 自动更新完成")
+            return True
+
+        logger.error(f"yt-dlp 自动更新失败: {(err or out)[-1000:]}")
+        return False
+
+
+def _find_ytdlp_output_file(output: str, tmp_dir: str) -> str:
+    """根据 yt-dlp 输出或临时目录扫描定位最终文件"""
     # 从输出中提取最终文件路径
-    output = stdout.decode(errors="replace").strip()
     lines = [l.strip() for l in output.splitlines() if l.strip()]
     if lines:
         filepath = lines[-1]
