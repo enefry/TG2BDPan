@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import urllib.parse
+from functools import lru_cache
 from typing import Optional, Callable, Awaitable
 
 import aiofiles
@@ -34,10 +35,58 @@ _YTDLP_UPDATE_WARNING_RE = re.compile(
 _HTML_ASSET_MIN_SIZE = 256
 _HTML_ASSET_MAX_CANDIDATES = 200
 _HTML_ASSET_CONCURRENCY = 5
+_HTML_IMAGE_URL_ATTRS = (
+    "src",
+    "data-src",
+    "data-original",
+    "data-original-src",
+    "data-lazy-src",
+    "data-url",
+    "ess-data",
+)
 _REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+_FALLBACK_MEDIA_DOMAINS: tuple[str, ...] = (
+    "youtube.com",
+    "youtu.be",
+    "bilibili.com",
+    "b23.tv",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "tiktok.com",
+    "douyin.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "facebook.com",
+    "fb.watch",
+    "reddit.com",
+    "twitch.tv",
+    "soundcloud.com",
+    "bandcamp.com",
+    "spotify.com",
+    "nicovideo.jp",
+    "niconico.jp",
+    "pornhub.com",
+    "xvideos.com",
+    "xnxx.com",
+    "v.qq.com",
+    "iqiyi.com",
+    "youku.com",
+    "mgtv.com",
+    "douban.com",
+    "kuaishou.com",
+    "weibo.com",
+    "weibo.cn",
+    "xiaohongshu.com",
+    "ixigua.com",
+    "sohu.com",
+    "le.com",
+    "163.com",
+    "56.com",
+)
 
 
 def _ensure_tmp_dir(user_id: int) -> str:
@@ -104,6 +153,7 @@ async def download_url(
     - 否则直接 HTTP 下载。
     返回本地文件路径。
     """
+    url = _replace_url_domain(url)
     tmp_dir: str = _ensure_tmp_dir(user_id)
     if _is_media_site(url):
         return await _download_ytdlp(url, tmp_dir, progress_cb)
@@ -111,22 +161,61 @@ async def download_url(
         return await _download_direct(url, tmp_dir, progress_cb)
 
 
+def _replace_url_domain(url: str) -> str:
+    """按配置替换 URL 的域名和端口，保留路径、查询参数和 fragment"""
+    if not config.URL_DOMAIN_REPLACEMENTS:
+        return url
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+
+    replacement = config.URL_DOMAIN_REPLACEMENTS.get(parsed.netloc.lower())
+    if not replacement:
+        return url
+
+    replaced = urllib.parse.urlunsplit(
+        (parsed.scheme, replacement, parsed.path, parsed.query, parsed.fragment)
+    )
+    logger.info(f"URL 域名端口已替换: {url} -> {replaced}")
+    return replaced
+
+
 def _is_media_site(url: str) -> bool:
-    """判断是否为视频/媒体平台链接"""
-    patterns: list[str] = [
-        r"youtube\.com",
-        r"youtu\.be",
-        r"bilibili\.com",
-        r"b23\.tv",
-        r"twitter\.com",
-        r"x\.com",
-        r"instagram\.com",
-        r"tiktok\.com",
-        r"v\.qq\.com",
-        r"iqiyi\.com",
-        r"youku\.com",
-    ]
-    return any(re.search(p, url, re.I) for p in patterns)
+    """判断是否为 yt-dlp 支持的视频/媒体平台链接"""
+    if _is_ytdlp_supported_url(url):
+        return True
+
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        return False
+
+    host = host.lower().strip(".")
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in _FALLBACK_MEDIA_DOMAINS
+    )
+
+
+def _is_ytdlp_supported_url(url: str) -> bool:
+    """使用 yt-dlp 内置 extractor 判断 URL，避免手工维护 supported sites 列表"""
+    try:
+        return any(extractor.suitable(url) for extractor in _get_ytdlp_extractors())
+    except Exception as exc:
+        logger.debug(f"yt-dlp supported-site 判断失败，使用兜底域名列表: {exc}")
+        return False
+
+
+@lru_cache(maxsize=1)
+def _get_ytdlp_extractors() -> tuple[type, ...]:
+    from yt_dlp.extractor import gen_extractor_classes
+
+    return tuple(
+        extractor
+        for extractor in gen_extractor_classes()
+        if extractor.IE_NAME.lower() != "generic"
+    )
 
 
 async def _download_http(
@@ -318,9 +407,8 @@ def _extract_html_asset_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
             urls.append(absolute)
 
     for img in soup.find_all("img"):
-        add(img.get("src"))
-        add(img.get("data-src"))
-        add(img.get("data-original"))
+        for attr in _HTML_IMAGE_URL_ATTRS:
+            add(img.get(attr))
         for src in _parse_srcset(str(img.get("srcset") or "")):
             add(src)
 
@@ -472,17 +560,7 @@ async def _download_ytdlp(
         await progress_cb(0, 0)  # 提示用户开始 yt-dlp 处理
 
     output_template: str = os.path.join(tmp_dir, "%(title)s.%(ext)s")
-    cmd: list[str] = [
-        "yt-dlp",
-        "--no-playlist",
-        "--output",
-        output_template,
-        "--merge-output-format",
-        "mp4",
-        "--print",
-        "after_move:filepath",  # 打印最终路径
-        url,
-    ]
+    cmd = _build_ytdlp_cmd(output_template, url)
     returncode, stdout, stderr = await _run_ytdlp(cmd)
 
     if returncode != 0 and _YTDLP_UPDATE_WARNING_RE.search(stderr):
@@ -491,6 +569,16 @@ async def _download_ytdlp(
             returncode, stdout, stderr = await _run_ytdlp(cmd)
         else:
             raise RuntimeError(f"yt-dlp 自动更新失败，原始错误:\n{stderr[-500:]}")
+
+    if returncode != 0 and _can_retry_ytdlp_with_cookies(cmd):
+        logger.warning("yt-dlp 无 cookies 下载失败，正在使用 cookies 重试")
+        retry_cmd = _build_ytdlp_cmd(output_template, url, with_cookies=True)
+        retry_code, retry_stdout, retry_stderr = await _run_ytdlp(retry_cmd)
+        if retry_code == 0:
+            returncode, stdout, stderr = retry_code, retry_stdout, retry_stderr
+        else:
+            logger.warning(f"yt-dlp cookies 重试失败: {retry_stderr[-500:]}")
+            returncode, stdout, stderr = retry_code, retry_stdout, retry_stderr
 
     if returncode != 0:
         raise RuntimeError(f"yt-dlp 下载失败:\n{stderr[-500:]}")
@@ -503,6 +591,59 @@ async def _download_ytdlp(
         await progress_cb(1, 1)  # 提示用户下载完成
 
     return _find_ytdlp_output_file(stdout, tmp_dir)
+
+
+def _build_ytdlp_cmd(
+    output_template: str, url: str, with_cookies: bool = False
+) -> list[str]:
+    cmd: list[str] = [
+        "yt-dlp",
+        "--no-playlist",
+        "--output",
+        output_template,
+        "--merge-output-format",
+        "mp4",
+        "--print",
+        "after_move:filepath",  # 打印最终路径
+        url,
+    ]
+    if config.YTDLP_FORMAT:
+        cmd[1:1] = ["--format", config.YTDLP_FORMAT]
+    if config.YTDLP_FORMAT_SORT:
+        cmd[1:1] = [
+            "--format-sort-force",
+            "--format-sort",
+            config.YTDLP_FORMAT_SORT,
+        ]
+    if with_cookies and config.YTDLP_COOKIES_FILE:
+        if os.path.isfile(config.YTDLP_COOKIES_FILE):
+            cmd[1:1] = ["--cookies", config.YTDLP_COOKIES_FILE]
+        else:
+            logger.warning(f"yt-dlp cookies 文件不存在: {config.YTDLP_COOKIES_FILE}")
+    elif with_cookies and config.YTDLP_COOKIES_FROM_BROWSER:
+        cmd[1:1] = ["--cookies-from-browser", config.YTDLP_COOKIES_FROM_BROWSER]
+    if with_cookies and _is_youtube_url(url) and config.YTDLP_YOUTUBE_PLAYER_CLIENT:
+        cmd[1:1] = [
+            "--extractor-args",
+            f"youtube:player_client={config.YTDLP_YOUTUBE_PLAYER_CLIENT}",
+        ]
+    return cmd
+
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(re.search(r"(youtube\.com|youtu\.be)", url, re.I))
+
+
+def _can_retry_ytdlp_with_cookies(cmd: list[str]) -> bool:
+    has_cookie_source = (
+        bool(config.YTDLP_COOKIES_FILE)
+        and os.path.isfile(config.YTDLP_COOKIES_FILE)
+    ) or bool(config.YTDLP_COOKIES_FROM_BROWSER)
+    return (
+        has_cookie_source
+        and "--cookies" not in cmd
+        and "--cookies-from-browser" not in cmd
+    )
 
 
 async def _run_ytdlp(cmd: list[str]) -> tuple[int, str, str]:
@@ -529,7 +670,7 @@ async def _update_ytdlp() -> bool:
             "install",
             "--no-cache-dir",
             "--upgrade",
-            "yt-dlp",
+            "yt-dlp[default]",
         ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,

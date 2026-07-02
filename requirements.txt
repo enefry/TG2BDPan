@@ -4,9 +4,10 @@ httpx[http2]
 aiosqlite
 aiofiles
 beautifulsoup4
-yt-dlp
+yt-dlp[default,curl-cffi]
 loguru
 Pillow
 python-magic
 pyahocorasick
 pyzipper
+yt-dlp-ejs

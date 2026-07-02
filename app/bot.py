@@ -115,9 +115,11 @@ class ProgressNotifier:
 
 
 def path_sensitive(path: str) -> str:
+    for word, replacement in config.CUSTOM_SENSITIVE_WORDS.items():
+        path = path.replace(word, replacement)
     nameTuple = os.path.splitext(os.path.basename(path))
     if len(nameTuple[0]) > 0:
-        name = f"{sensitiveDetector.replace(nameTuple[0],repl="_")}"
+        name = sensitiveDetector.replace(nameTuple[0].strip(), repl="_").strip()
         if len(nameTuple[1]) > 1:
             return f"{name}{nameTuple[1]}"
         else:
@@ -173,9 +175,8 @@ async def safe_upload(
 ) -> dict[str, Any]:
     need_remove_files = set()
     dir_name = os.path.dirname(local_path)
+    remote_filename = path_sensitive(remote_filename)
     base_name = os.path.splitext(remote_filename)[0]
-    base_name = sensitiveDetector.replace(base_name, "_")
-    remote_filename = f"{base_name}{os.path.splitext(remote_filename)[1]}"
     is_nsfw = await nsfw_detect(local_path)
     logger.info(
         f"NSFW Detection: path={local_path},remote filename={remote_filename}, is_nsfw: {is_nsfw},is directory: {os.path.isdir(local_path)}"

@@ -23,6 +23,18 @@ async def background_refresh_task():
         await asyncio.sleep(43200)  # 12 小时
 
 
+async def config_watch_task():
+    """监控 JSON 配置文件变化，刷新运行期配置。"""
+    while True:
+        try:
+            if config.reload_json_config_if_changed():
+                logger.info(f"配置文件已重新加载: {config.CONFIG_FILE}")
+        except Exception:
+            logger.exception("配置文件监控刷新失败")
+
+        await asyncio.sleep(5)
+
+
 async def main():
     # 配置 loguru 日志
     logger.add(
@@ -60,6 +72,7 @@ async def main():
 
     # 启动后台刷新任务
     refresh_task = asyncio.create_task(background_refresh_task())
+    config_task = asyncio.create_task(config_watch_task())
 
     # 保持运行
     try:
@@ -69,6 +82,7 @@ async def main():
         pass
     finally:
         refresh_task.cancel()
+        config_task.cancel()
         await application.updater.stop()
         await application.stop()
         await application.shutdown()

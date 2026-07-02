@@ -7,13 +7,10 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      # - ./app/bot.py:/app/bot.py
-      # - ./app/nsfw_detect.py:/app/nsfw_detect.py
-      # - ./app/sensitive_detect.py:/app/sensitive_detect.py
-      # - ./app/baidu_pan.py:/app/baidu_pan.py
       - ./tmp:/tmp/
       - ./log:/var/log
       - ./tg_data:/var/lib/telegram-bot-api
+      - /media/data/service/data/workspace/mozilla:/data/mozilla
     extra_hosts:
       - "pcs.baidu.com:36.110.192.115"
       - "pcs.baidu.com:111.63.96.140"

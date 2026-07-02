@@ -1,0 +1,15 @@
+{
+  "url_domain_replacements": {
+    "old.example.com:8080": "new.example.com:9090",
+    "10.0.0.2:8000": "public.example.com:443"
+  },
+  "ytdlp_cookies_file": "/app/data/ytdlp-cookies.txt",
+  "ytdlp_cookies_from_browser": "firefox:/data/mozilla/firefox/7u8bnsv1.default-esr",
+  "ytdlp_youtube_player_client": "mweb",
+  "ytdlp_format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+  "ytdlp_format_sort": "vcodec:hevc:h264:av1,res,fps,br",
+  "custom_sensitive_words": {
+    "王局拍案": "wj",
+    "共产党": "ggg"
+  }
+}

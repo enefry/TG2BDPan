@@ -2,6 +2,9 @@
 __pycache__
 .venv
 tmp
-data
+data/*
+!data/config.sample.json
 log
 tg_data
+data/config.json
+data/pan_saver.db

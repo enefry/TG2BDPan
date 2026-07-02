@@ -1,8 +1,10 @@
 FROM python:3.14-slim
 
-# 安装 yt-dlp 需要的 ffmpeg，以及用于密码压缩的 zip
+# 安装 yt-dlp 需要的 ffmpeg、Deno(JS runtime)，以及用于密码压缩的 zip
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg curl zip libmagic1 && \
+    apt-get install -y --no-install-recommends ffmpeg curl zip unzip ca-certificates libmagic1 && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    deno --version && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
